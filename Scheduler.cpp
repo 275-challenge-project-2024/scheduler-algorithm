@@ -2,16 +2,48 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <unistd.h>
-#include "task_heap.h"
+#include <pthread.h>
+#include <tuple>
 
-#include "worker_heap.h"  // assuming heap.h is available for import
-#include "queue.h"
+#include "worker_heap.h"
+#include "task_heap.h"
+#include "task_worker_mapping.h"
+
+#include <memory>
+#include <string>
+#include <grpcpp/grpcpp.h>
+#include "../worker-derian/task.grpc.pb.h"
+
+using grpc::Channel;
+using grpc::ClientContext;
+using grpc::Status;
+using taskscheduler::Task;
+using taskscheduler::TaskStatus;
+using taskscheduler::TaskScheduler;
 
 #define verbose 1
 
-extern key_t worker_heap_k = "worker_heap";  // external key
-extern key_t task_heap_k = "task_heap";
-extern key_t asgnd_tasks_q_k = "assigned_tasks_queue";
+extern key_t worker_heap_k;  // external key
+extern key_t task_heap_k;
+extern key_t asgnd_tasks_k;
+
+class TaskSchedulerClient {
+public:
+    TaskSchedulerClient(std::shared_ptr<Channel> channel)
+        : stub_(TaskScheduler::NewStub(channel)) {}
+
+    Status SubmitTask(TaskElement task) {
+        TaskStatus status;
+        ClientContext context;
+
+        Status grpcStatus = stub_->SubmitTask(&context, task, &status);
+
+        return status
+    }
+ 
+private:
+    std::unique_ptr<TaskScheduler::Stub> stub_;
+};
 
 class Scheduler {
 
@@ -19,86 +51,109 @@ public:
     int worker_shm_id;
     int task_shm_id;
     int asgnd_tasks_shm_id;
-    Heap* worker_heap;
-    HeapData* task_heap;
-    Queue* asgnd_tasks_q;
-    Scheduler() {
-        worker_shm_id = shmget(worker_heap_k, sizeof(Heap) + INITIAL_CAPACITY * sizeof(HeapItem), 0666);
+    HeapData* worker_heap;
+    TaskHeapData* task_heap;
+    TaskWorkerMappingList* asgnd_tasks_list;
+   Scheduler() {
+        worker_shm_id = shmget(worker_heap_k, sizeof(HeapData), 0666);
         if (worker_shm_id == -1) {
             perror("shmget for worker queue failed in Scheduler constructor");
             exit(1); 
         }
-        worker_heap = (Heap*)shmat(worker_shm_id, NULL, 0);
+        worker_heap = (HeapData*)shmat(worker_shm_id, NULL, 0);
         if (worker_heap == (void*) -1) {
             perror("shmat for worker queue failed in Scheduler constructor");
             exit(1);
         }
 
-        task_shm_id = shmget(task_heap_k, sizeof(Heap) + INITIAL_CAPACITY * sizeof(HeapItem), 0666);
+        task_shm_id = shmget(task_heap_k, sizeof(TaskHeapData), 0666);
         if (task_shm_id == -1) {
             perror("shmget for task queue failed in Scheduler constructor");
             exit(1); 
         }
-        task_heap = (Heap*)shmat(task_shm_id, NULL, 0);
+        task_heap = (TaskHeapData*)shmat(task_shm_id, NULL, 0);
         if (task_heap == (void*) -1) {
             perror("shmat for task queue failed in Scheduler constructor");
             exit(1);
         }
 
-        asgnd_tasks_shm_id = shmget(asgnd_tasks_q_k, sizeof(Queue), 0666);
+        asgnd_tasks_shm_id = shmget(asgnd_tasks_k, sizeof(TaskWorkerMappingList), 0666);
         if (asgnd_tasks_shm_id == -1) {
             perror("shmget for assigned tasks queue failed in Scheduler constructor");
             exit(1); 
         }
-        asgnd_tasks_q = (Heap*)shmat(asgnd_tasks_shm_id, NULL, 0);
-        if (asgnd_tasks_q == (void*) -1) {
+        asgnd_tasks_list = (TaskWorkerMappingList*)shmat(asgnd_tasks_shm_id, NULL, 0);
+        if (asgnd_tasks_list == (void*) -1) {
             perror("shmat for assigned tasks queue failed in Scheduler constructor");
             exit(1);
         }
 
     }
 
-    ~Scheduler() {
-        if (shmdt(heap) == -1) {
-            perror("shmdt failed in Scheduler destructor");
-        }
-    }
+    // ~Scheduler() {
+    //     if (shmdt(heap) == -1) {
+    //         perror("shmdt failed in Scheduler destructor");
+    //     }
+    // }
 
-    HeapItem getWorkerWithMaxCapacity() {
-        while(sch.worker_heap->lock == true){
-
+    HeapElement getWorkerWithMaxCapacity() {
+        pthread_mutex_lock(&this->worker_heap->mutex);
+        if(worker_heap->size == 0) {
+            pthread_mutex_unlock(&this->worker_heap->mutex);
+            return nullptr;
         }
-        sch.worker_heap->lock = true;
-        HeapItem topWorker = worker_heap->data[0];
-        sch.worker_heap->lock = false;
+        HeapElement topWorker = worker_heap->data[0];
+        pthread_mutex_unlock(&this->worker_heap->mutex);
         return topWorker;
     }
 
-    HeapElement getTaskWithMaxPriority(){
-        while(sch.task_heap->lock == true){
-
+    TaskElement getTaskWithMaxPriority(){
+        pthread_mutex_lock(&this->task_heap->mutex);
+        if(task_heap->size == 0) {
+            pthread_mutex_unlock(&this->task_heap->mutex);
+            return nullptr;
         }
-        sch.task_heap->lock = true;
-        HeapElement topTask = heap_pop(sch->task_heap);
-        heapify_down(task_heap, 0);
-        sch.task_heap->lock = false;
+        TaskElement topTask = heap_pop(this->task_heap);
+        heapify_down(this->task_heap, 0);
+        pthread_mutex_unlock(&this->task_heap->mutex);
         return topTask;
     }
 
-    void pushAssignedTaskToQueue(HeapElement task, int workerId){
-        queue_push(sch->asgnd_tasks_q, (task, workerId))
+    void pushAssignedTaskToWorker(TaskElement task, HeapElement worker){
+        TaskWorkerMapping taskMap;
+        taskMap.clientIp = task.clientIp;
+        taskMap.priority = task.priority;
+        taskMap.taskId = task.taskId;
+        taskMap.workerId = worker.workerId;
+        TaskSchedulerClient client(grpc::CreateChannel(worker.workerId, grpc::InsecureChannelCredentials()));
+        Status response = client.SubmitTask(task);
+        if (response.ok()){
+            pthread_mutex_lock(&this->asgnd_tasks_list->mutex);
+            this->asgnd_tasks_list[this->asgnd_tasks_list->size++] = taskMap;
+            pthread_mutex_unlock(&this->asgnd_tasks_list->mutex);
+        }
     }
+    
 };
 
 int main(){
     if (verbose > 1){
         std::cout << "Starting Scheduler Process" << std::endl;
     }
-    Scheduler sch = new Scheduler();
+    Scheduler sch = Scheduler();
     while(1){
-        HeapElement topTask = sch.getTaskWithMaxPriority();
-        int workerId = sch.getWorkerWithMaxCapacity()->workerId;
-        sch.pushAssignedTaskToQueue(task, workerId);
-
+        long sleepTime = 10000L+(long)((1e5-1e4)*rand()/(RAND_MAX+1.0));  
+        TaskElement topTask = sch.getTaskWithMaxPriority();
+        while(topTask == nullptr){
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepTime));
+            topTask = sch.getTaskWithMaxPriority();
+        }
+        HeapElement worker = sch.getWorkerWithMaxCapacity();
+        while(worker == nullptr){
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepTime));
+            worker = sch.getWorkerWithMaxCapacity();
+        }
+        sch.pushAssignedTaskToWorker(task, worker);
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleepTime)); 
     }
 }
