@@ -1,28 +1,53 @@
-cmake_minimum_required(VERSION 3.8)
-project(scheduler_service CXX)
+cmake_minimum_required(VERSION 3.16)
+project(MyGrpcProject)
 
-# include gRPC if needed 
-include(/Users/rashmisharma/Development/sjsu/cmpe-275/grpc/examples/cpp/cmake/common.cmake)
+set(CMAKE_CXX_STANDARD 17)
 
-# Shared Memory-Based Heap Code
-add_library(heap STATIC heap.cpp)  # assuming heap code is in heap.cpp
-target_include_directories(heap PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:include>) 
-
-# scheduler Service
-add_executable(scheduler scheduler.cpp)
-
-# link with Heap Library
-target_link_libraries(scheduler heap)
-
-find_package(Protobuf REQUIRED)
 find_package(gRPC REQUIRED)
+find_package(Protobuf CONFIG REQUIRED)
+find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)
+find_package(absl CONFIG REQUIRED)
 
-include_directories(${PROTOBUF_INCLUDE_DIR} ${gRPC_CPP_PLUGIN_INCLUDE_DIR} ${gRPC_INCLUDE_DIR})
+set(_PROTOBUF_LIBPROTOBUF protobuf::libprotobuf)
+set(_REFLECTION gRPC::grpc++_reflection)
+set(_GRPC_GRPCPP gRPC::grpc++)
 
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS protos/healthcheck.proto)
-grpc_generate_cpp(GRPC_SRCS GRPC_HDRS protos/healthcheck.proto)
+# Assuming task.proto is in the same directory as your CMakeLists.txt
+set(PROTO_PATH "${CMAKE_CURRENT_SOURCE_DIR}")
+set(TASK_SCHEDULER_PROTO "${PROTO_PATH}/task.proto")
 
-add_executable(scheduler scheduler.cpp ${PROTO_SRCS} ${PROTO_HDRS} ${GRPC_SRCS} ${GRPC_HDRS})
-target_link_libraries(scheduler heap ${PROTOBUF_LIBRARY} ${gRPC_LIBRARY})
+set(GENERATED_PROTOBUF_PATH "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY ${GENERATED_PROTOBUF_PATH})
+
+set(TASK_SCHEDULER_PB_CPP_FILE "${GENERATED_PROTOBUF_PATH}/task.pb.cc")
+set(TASK_SCHEDULER_PB_H_FILE "${GENERATED_PROTOBUF_PATH}/task.pb.h")
+set(TASK_SCHEDULER_GRPC_PB_CPP_FILE "${GENERATED_PROTOBUF_PATH}/task.grpc.pb.cc")
+set(TASK_SCHEDULER_GRPC_PB_H_FILE "${GENERATED_PROTOBUF_PATH}/task.grpc.pb.h")
+
+add_custom_command(
+      OUTPUT "${TASK_SCHEDULER_PB_H_FILE}"
+             "${TASK_SCHEDULER_PB_CPP_FILE}"
+             "${TASK_SCHEDULER_GRPC_PB_H_FILE}"
+             "${TASK_SCHEDULER_GRPC_PB_CPP_FILE}"
+      COMMAND protobuf::protoc
+      ARGS --grpc_out "${GENERATED_PROTOBUF_PATH}"
+           --cpp_out "${GENERATED_PROTOBUF_PATH}"
+           -I "${PROTO_PATH}"
+           --plugin=protoc-gen-grpc="${GRPC_CPP_PLUGIN_EXECUTABLE}"
+           "${TASK_SCHEDULER_PROTO}"
+      DEPENDS "${TASK_SCHEDULER_PROTO}")
+
+include_directories("${GENERATED_PROTOBUF_PATH}")
+
+add_executable(scheduler scheduler.cpp
+    ${TASK_SCHEDULER_PB_CPP_FILE}
+    ${TASK_SCHEDULER_GRPC_PB_CPP_FILE})
+target_link_libraries(scheduler
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF}
+    absl::base
+    absl::strings
+    absl::synchronization
+    absl::time
+    absl::log)
